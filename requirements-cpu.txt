@@ -1,0 +1,18 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# requirements-cpu.txt
+# Python 3.13 · CPU-only build
+#
+# Установка:
+#   pip install -r requirements-cpu.txt
+# ──────────────────────────────────────────────────────────────────────────────
+
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+torch==2.14.1+cpu
+torchvision==0.29.1+cpu
+numpy==2.5.2
+matplotlib==3.11.2
+timm==1.0.30
+datasets==5.1.0
+scikit-learn==1.9.1
+pytest==9.1.1

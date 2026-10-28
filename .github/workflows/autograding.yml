@@ -1,0 +1,250 @@
+name: Autograding
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+
+permissions: {}
+
+concurrency:
+  group: autograding-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  # =====================================================================
+  # Стадия 1: TEST
+  # =====================================================================
+  test:
+    name: Run autograder in isolated Docker
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+
+    steps:
+      - name: Check tests readiness
+        run: |
+          if [[ "${{ secrets.TESTS_READY }}" != "1" ]]; then
+            echo "::error::Тесты ещё не готовы."
+            exit 1
+          fi
+          echo "Тесты доступны"
+
+      - name: Checkout student code
+        uses: actions/checkout@v4.2.2
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: student
+          fetch-depth: 1
+          persist-credentials: false
+          submodules: false
+          lfs: false
+
+      - name: Checkout reference
+        uses: actions/checkout@v4.2.2
+        with:
+          repository: L1st3ner/dl_sem5_lab03_aie_reference
+          ref: main
+          token: ${{ secrets.REFERENCE_TOKEN }}
+          path: reference
+          fetch-depth: 1
+          persist-credentials: false
+          submodules: false
+          lfs: false
+
+      - name: Setup Python for sandbox assembly
+        uses: actions/setup-python@v5.3.0
+        with:
+          python-version: '3.13'
+
+      - name: Assemble sandbox
+        run: |
+          set -euo pipefail
+
+          mkdir sandbox
+
+          rsync -a --exclude='.git' --exclude='.github' student/ sandbox/
+
+          find sandbox/ -name "*.pyc" -type f -delete
+          find sandbox/ -name "__pycache__" -type d -exec rm -rf {} +
+
+          if [[ -e sandbox/reference ]]; then
+            echo "::error::Папка 'reference' в решении зарезервирована системой тестирования"
+            exit 1
+          fi
+
+          rsync -a --exclude='.git' reference/ sandbox/reference/
+
+          python -m compileall -b sandbox/reference/
+          find sandbox/reference/ -name "*.py" -type f -delete
+          find sandbox/ -name '.git' -prune -exec rm -rf {} +
+
+          echo "Песочница собрана"
+          echo "Размер sandbox: $(du -sh sandbox | cut -f1)"
+
+      - name: Prepare output directory
+        run: |
+          mkdir -p "${GITHUB_WORKSPACE}/grading-output"
+          chmod 777 "${GITHUB_WORKSPACE}/grading-output"
+
+      - name: Build test image
+        run: |
+          set -euo pipefail
+          cat > /tmp/Dockerfile.test <<'DOCKERFILE'
+          FROM python:3.13-slim
+
+          RUN pip install --no-cache-dir \
+              --extra-index-url https://download.pytorch.org/whl/cpu \
+              torch==2.14.1+cpu \
+              torchvision==0.29.1+cpu
+
+          RUN pip install --no-cache-dir \
+              numpy==2.5.2 \
+              matplotlib==3.11.2 \
+              timm==1.0.30 \
+              pytest==8.3.3
+          DOCKERFILE
+
+          docker build -t test-runner:local -f /tmp/Dockerfile.test /tmp
+          echo "Образ собран: $(docker images test-runner:local --format '{{.Size}}')"
+
+      - name: Run tests (Isolated Docker, No Network)
+        run: |
+          set -euo pipefail
+
+          echo "═══════════════════════════════════════════════════"
+          echo "  Запуск тестов в изолированном контейнере"
+          echo "  Python       : 3.13"
+          echo "  Network      : none"
+          echo "  Memory       : 1g"
+          echo "  CPU          : 1.0"
+          echo "  User         : 65534 (nobody)"
+          echo "═══════════════════════════════════════════════════"
+
+          docker run --rm \
+            --network none \
+            --read-only \
+            --cap-drop ALL \
+            --security-opt no-new-privileges \
+            --pids-limit 256 \
+            --memory 1g \
+            --cpus 1.0 \
+            --user 65534:65534 \
+            --tmpfs /tmp:rw,noexec,nosuid,size=128m \
+            --mount type=bind,src="${GITHUB_WORKSPACE}/sandbox",dst=/workspace,readonly \
+            --mount type=bind,src="${GITHUB_WORKSPACE}/grading-output",dst=/output \
+            --workdir /workspace \
+            -e HOME=/tmp \
+            -e PYTHONHASHSEED=0 \
+            -e PYTHONDONTWRITEBYTECODE=1 \
+            -e GRADING_OUTPUT_DIR=/output \
+            test-runner:local \
+            python -B -E -m reference.tests.test_summary
+
+      - name: Verify grading.json exists
+        if: always()
+        run: |
+          if [[ ! -f "${GITHUB_WORKSPACE}/grading-output/grading.json" ]]; then
+            echo "::warning::grading.json не создан — вероятно, ошибка валидации ISU"
+            exit 0
+          fi
+          echo "grading.json найден:"
+          python3 -m json.tool "${GITHUB_WORKSPACE}/grading-output/grading.json" | head -20
+
+      - name: Upload grading results
+        if: always()
+        uses: actions/upload-artifact@v4.4.3
+        with:
+          name: grading-${{ github.event.pull_request.number }}-${{ github.run_attempt }}
+          path: grading-output/grading.json
+          if-no-files-found: ignore
+          retention-days: 1
+
+  # =====================================================================
+  # Стадия 2: REPORT
+  # =====================================================================
+  report:
+    name: Export results to Google Sheets
+    needs: test
+    if: always() && needs.test.result != 'cancelled'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+
+    steps:
+      - name: Download grading artifact
+        uses: actions/download-artifact@v4.1.8
+        with:
+          name: grading-${{ github.event.pull_request.number }}-${{ github.run_attempt }}
+          path: grading-output
+        continue-on-error: true
+
+      - name: Check grading.json
+        id: check
+        run: |
+          if [[ ! -f "grading-output/grading.json" ]]; then
+            echo "::warning::grading.json отсутствует — экспорт пропущен"
+            echo "has_grading=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_grading=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout export script
+        if: steps.check.outputs.has_grading == 'true'
+        uses: actions/checkout@v4.2.2
+        with:
+          repository: L1st3ner/dl_sem5_lab03_aie_reference
+          ref: main
+          token: ${{ secrets.REFERENCE_TOKEN }}
+          path: reference
+          fetch-depth: 1
+          persist-credentials: false
+          sparse-checkout: |
+            scripts/export_results.py
+          sparse-checkout-cone-mode: false
+
+      - name: Setup Python
+        if: steps.check.outputs.has_grading == 'true'
+        uses: actions/setup-python@v5.3.0
+        with:
+          python-version: '3.13'
+
+      - name: Install export dependencies
+        if: steps.check.outputs.has_grading == 'true'
+        run: |
+          pip install --no-cache-dir \
+            gspread==6.1.4 \
+            google-auth==2.36.0
+
+      - name: Export to Google Sheets
+        if: steps.check.outputs.has_grading == 'true'
+        env:
+          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          COMMIT_SHA: ${{ github.event.pull_request.head.sha }}
+          GITHUB_USER: ${{ github.event.pull_request.user.login }}
+        run: |
+          python reference/scripts/export_results.py grading-output/grading.json
+
+  # =====================================================================
+  # Стадия 3: CLEANUP
+  # =====================================================================
+  cleanup:
+    name: Delete workflow artifacts
+    needs: [test, report]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions:
+      actions: write
+
+    steps:
+      - name: Delete grading artifact
+        uses: geekyeggo/delete-artifact@v5.0.0
+        with:
+          name: grading-${{ github.event.pull_request.number }}-${{ github.run_attempt }}
+          failOnError: false
