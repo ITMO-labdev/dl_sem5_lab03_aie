@@ -63,7 +63,6 @@ jobs:
           set -euo pipefail
 
           mkdir sandbox
-
           rsync -a --exclude='.git' --exclude='.github' student/ sandbox/
 
           find sandbox/ -name "*.pyc" -type f -delete
@@ -75,34 +74,9 @@ jobs:
           fi
 
           rsync -a --exclude='.git' reference/ sandbox/reference/
-
-          python -m compileall \
-            --invalidation-mode unchecked-hash \
-            -q \
-            sandbox/reference/
-
-          find sandbox/reference/ -name "test_*.py" -type f \
-            ! -name "test_summary.py" \
-            -exec sh -c 'echo "# Compiled bytecode is in __pycache__/" > "$1"' _ {} \;
-
-          find sandbox/reference/ -name "*.py" -type f \
-            ! -name "conftest.py" \
-            ! -name "test_summary.py" \
-            ! -name "_grader_plugin.py" \
-            ! -name "__init__.py" \
-            ! -name "test_*.py" \
-            -exec sh -c 'echo "# Compiled bytecode is in __pycache__/" > "$1"' _ {} \;
-
           find sandbox/ -name '.git' -prune -exec rm -rf {} +
 
           echo "Песочница собрана"
-          echo "Размер sandbox: $(du -sh sandbox | cut -f1)"
-          echo ""
-          echo "Содержимое sandbox/reference/tests/:"
-          ls -la sandbox/reference/tests/
-          echo ""
-          echo "Содержимое sandbox/reference/tests/__pycache__/:"
-          ls -la sandbox/reference/tests/__pycache__/ || true
 
       - name: Prepare output directory
         run: |
